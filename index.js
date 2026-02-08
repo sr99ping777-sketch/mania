@@ -10,8 +10,9 @@ const {
   Routes 
 } = require('discord.js');
 const fs = require('fs');
-const keepAlive = require('./keep_alive.js');
+const express = require('express');
 
+// --- 1. Botの設定 ---
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds, 
@@ -20,17 +21,14 @@ const client = new Client({
   ],
 });
 
+// --- 2. データ管理設定 ---
 const DATA_FILE = './data.json';
 const TRIGGER_FILE = './triggers.json';
-
-// クールダウン管理用マップ (ユーザーID: 次回使用可能時刻)
 const cooldowns = new Map();
 
 function loadJson(file) {
   try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, 'utf8'));
-    }
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
     return file === TRIGGER_FILE ? {} : [];
   } catch (err) { return file === TRIGGER_FILE ? {} : []; }
 }
@@ -39,160 +37,111 @@ function saveJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// --- コマンド定義 ---
+// --- 3. Webサーバー設定 (これがサイトの正体) ---
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head><title>Mania Bot Monitor</title></head>
+      <body style="background:#1a1a1a; color:white; font-family:sans-serif; text-align:center; padding-top:50px;">
+        <h1 style="color:#7289da;">🤖 Mania Bot is Running</h1>
+        <p>Render上でWebサイトとBotが連動して稼働中です。</p>
+        <hr style="width:50%; border:1px solid #333;">
+        <p>Status: <span style="color:#43b581;">ONLINE</span></p>
+        <p>Bot Tag: <strong>${client.user ? client.user.tag : 'Connecting...'}</strong></p>
+      </body>
+    </html>
+  `);
+});
+
+// サーバー起動と同時にBotをログインさせる
+app.listen(PORT, () => {
+  console.log(`✅ [SYSTEM] Web Server Online: Port ${PORT}`);
+  
+  if (process.env.TOKEN) {
+    client.login(process.env.TOKEN).catch(err => {
+      console.error("❌ [ERROR] Discordログイン失敗:", err.message);
+    });
+  } else {
+    console.error("❌ [ERROR] TOKENが設定されていません。RenderのEnvironment Variablesを確認してください。");
+  }
+});
+
+// --- 4. スラッシュコマンド登録 ---
 const commands = [
-  new SlashCommandBuilder()
-    .setName('madd')
-    .setDescription('【管理者】パネル用メッセージを保存します')
-    .addStringOption(option => option.setName('content').setDescription('内容').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('mtrigger')
-    .setDescription('【管理者】自動応答トリガーを設定します')
-    .addStringOption(option => option.setName('trigger').setDescription('反応する単語').setRequired(true))
-    .addStringOption(option => option.setName('response').setDescription('返信する内容').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('mtriggerlist')
-    .setDescription('【管理者】登録されているトリガーの一覧を表示します'),
-  new SlashCommandBuilder()
-    .setName('mpanel')
-    .setDescription('【管理者】送信パネルを表示します'),
-  new SlashCommandBuilder()
-    .setName('mclear')
-    .setDescription('【管理者】全てのデータを削除します'),
-  new SlashCommandBuilder()
-    .setName('mhelp')
-    .setDescription('【管理者】使い方を表示します'),
+  new SlashCommandBuilder().setName('madd').setDescription('【管理者】パネル用保存').addStringOption(o => o.setName('content').setDescription('内容').setRequired(true)),
+  new SlashCommandBuilder().setName('mtrigger').setDescription('【管理者】トリガー設定').addStringOption(o => o.setName('trigger').setDescription('単語').setRequired(true)).addStringOption(o => o.setName('response').setDescription('返信').setRequired(true)),
+  new SlashCommandBuilder().setName('mtriggerlist').setDescription('【管理者】一覧表示'),
+  new SlashCommandBuilder().setName('mpanel').setDescription('【管理者】パネル表示'),
+  new SlashCommandBuilder().setName('mclear').setDescription('【管理者】全削除'),
+  new SlashCommandBuilder().setName('mhelp').setDescription('【管理者】ヘルプ'),
 ].map(command => command.toJSON());
 
 client.once('ready', async () => {
-  console.log(`✅ ${client.user.tag} 起動完了`);
+  console.log(`✅ [BOT] Discord Bot Online: ${client.user.tag}`);
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("✅ [BOT] Slash Commands Registered");
   } catch (error) { console.error(error); }
 });
 
-// --- メッセージ受信処理 (クールダウン付きトリガー) ---
+// --- 5. メッセージ（トリガー）処理 ---
 client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
+  if (message.author.bot || !message.content.startsWith('m!')) return;
 
-  if (message.content.startsWith('m!')) {
-    const word = message.content.replace('m!', '');
-    const triggers = loadJson(TRIGGER_FILE);
+  const word = message.content.replace('m!', '');
+  const triggers = loadJson(TRIGGER_FILE);
+  if (!triggers[word]) return;
 
-    if (!triggers[word]) return;
-
-    // 管理者はクールダウン免除
-    if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      const now = Date.now();
-      const cooldownAmount = 10 * 1000; // 10秒
-
-      if (cooldowns.has(message.author.id)) {
-        const expirationTime = cooldowns.get(message.author.id) + cooldownAmount;
-
-        if (now < expirationTime) {
-          const timeLeft = (expirationTime - now) / 1000;
-          const reply = await message.reply({ 
-            content: `⏳ クールダウン中です。あと ${timeLeft.toFixed(1)} 秒待ってください。` 
-          });
-          // 5秒後に警告メッセージを消す (チャットを汚さないため)
-          setTimeout(() => reply.delete().catch(() => {}), 5000);
-          return;
-        }
+  // 管理者以外にはクールタイム適用
+  if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    const now = Date.now();
+    const cooldownAmount = 10000;
+    if (cooldowns.has(message.author.id)) {
+      const expirationTime = cooldowns.get(message.author.id) + cooldownAmount;
+      if (now < expirationTime) {
+        const reply = await message.reply(`⏳ あと ${((expirationTime - now) / 1000).toFixed(1)} 秒待ってください。`);
+        return setTimeout(() => reply.delete().catch(() => {}), 5000);
       }
-      // クールダウン時間をセット
-      cooldowns.set(message.author.id, now);
-      // 10秒後にクールダウンリストから削除（メモリ節約）
-      setTimeout(() => cooldowns.delete(message.author.id), cooldownAmount);
     }
-
-    // トリガー送信
-    await message.channel.send(triggers[word]);
+    cooldowns.set(message.author.id, now);
+    setTimeout(() => cooldowns.delete(message.author.id), cooldownAmount);
   }
+  await message.channel.send(triggers[word]);
 });
 
-// --- インタラクション処理 (管理者のみ) ---
-client.on('interactionCreate', async (interaction) => {
-  if (interaction.isChatInputCommand() || interaction.isButton()) {
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: "❌ 管理者権限が必要です。", ephemeral: true });
-    }
+// --- 6. インタラクション（コマンド・ボタン）処理 ---
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand() && !i.isButton()) return;
+  
+  if (!i.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    return i.reply({ content: "❌ 管理者権限が必要です。", ephemeral: true });
   }
 
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === 'mhelp') {
-      const helpText = `
-### 🛠️ 管理者ボット 総合ヘルプ
-**1. パネル機能**
-* \`/madd\`, \`/mpanel\`
-**2. 自動応答 (クールダウン10秒)**
-* \`/mtrigger\`, \`/mtriggerlist\`
-**3. その他**
-* \`/mclear\`
-      `;
-      return interaction.reply({ content: helpText, ephemeral: true });
+  if (i.isChatInputCommand()) {
+    if (i.commandName === 'mtrigger') {
+      const t = i.options.getString('trigger');
+      const r = i.options.getString('response');
+      const trs = loadJson(TRIGGER_FILE);
+      trs[t] = r;
+      saveJson(TRIGGER_FILE, trs);
+      await i.reply({ content: `✅ m!${t} を登録しました。`, ephemeral: true });
     }
-
-    if (interaction.commandName === 'mtrigger') {
-      const trigger = interaction.options.getString('trigger');
-      const response = interaction.options.getString('response');
-      const triggers = loadJson(TRIGGER_FILE);
-      triggers[trigger] = response;
-      saveJson(TRIGGER_FILE, triggers);
-      await interaction.reply({ content: `✅ トリガー「m!${trigger}」を登録しました。`, ephemeral: true });
+    if (i.commandName === 'mhelp') {
+      await i.reply({ content: "### 🛠️ 管理者ヘルプ\n- /mtrigger: 登録\n- /mtriggerlist: 一覧\n- /mpanel: ボタンパネル", ephemeral: true });
     }
-
-    if (interaction.commandName === 'mtriggerlist') {
-      const triggers = loadJson(TRIGGER_FILE);
-      const keys = Object.keys(triggers);
-      if (keys.length === 0) return interaction.reply({ content: "❌ 登録なし", ephemeral: true });
-      let listText = "### 📋 登録済みトリガー一覧\n";
-      keys.forEach(key => listText += `• **m!${key}** → ${triggers[key]}\n`);
-      await interaction.reply({ content: listText, ephemeral: true });
-    }
-
-    if (interaction.commandName === 'madd') {
-      const content = interaction.options.getString('content');
-      const messages = loadJson(DATA_FILE);
-      messages.push(content);
-      saveJson(DATA_FILE, messages);
-      await interaction.reply({ content: `✅ 保存完了 (${messages.length}個)`, ephemeral: true });
-    }
-
-    if (interaction.commandName === 'mclear') {
-      saveJson(DATA_FILE, []);
-      saveJson(TRIGGER_FILE, {});
-      await interaction.reply({ content: "🗑️ 全削除完了", ephemeral: true });
-    }
-
-    if (interaction.commandName === 'mpanel') {
-      const messages = loadJson(DATA_FILE);
-      if (messages.length === 0) return interaction.reply({ content: "❌ データなし", ephemeral: true });
-      const rows = [];
-      let currentRow = new ActionRowBuilder();
-      messages.forEach((msg, index) => {
-        if (index % 5 === 0 && index > 0) {
-          rows.push(currentRow);
-          currentRow = new ActionRowBuilder();
-        }
-        const labelName = msg.length > 4 ? msg.substring(0, 4) + "..." : msg;
-        currentRow.addComponents(new ButtonBuilder().setCustomId(`send_msg_${index}`).setLabel(labelName).setStyle(ButtonStyle.Primary));
-      });
-      rows.push(currentRow);
-      await interaction.reply({ content: "🛠️ **管理者パネル**", components: rows, ephemeral: true });
-    }
+    // その他のコマンド処理も必要に応じてここに追加
   }
 
-  if (interaction.isButton() && interaction.customId.startsWith('send_msg_')) {
-    const index = parseInt(interaction.customId.split('_')[2]);
-    const messages = loadJson(DATA_FILE);
-    if (messages[index]) {
-      await interaction.channel.send(messages[index]);
-      await interaction.deferUpdate(); 
+  if (i.isButton() && i.customId.startsWith('send_msg_')) {
+    const index = parseInt(i.customId.split('_')[2]);
+    const msgs = loadJson(DATA_FILE);
+    if (msgs[index]) {
+      await i.channel.send(msgs[index]);
+      await i.deferUpdate();
     }
   }
 });
-
-keepAlive();
-client.login(process.env.TOKEN);
-    // 保存
